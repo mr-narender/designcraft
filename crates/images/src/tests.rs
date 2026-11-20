@@ -40,6 +40,27 @@ fn svg_depth_is_checked_before_recursive_parsing() {
     }
 }
 
+/// An SVG whose `<use>` elements hold one another `links` deep, with no element nested deeper
+/// than four levels (the root counts as one).
+fn use_chain_svg(links: usize) -> String {
+    let chain: String = (0..links).map(|i| format!("<g id='g{i}'><use xlink:href='#g{}'/></g>", i + 1)).collect();
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><defs>{chain}<rect id='g{links}' width='10' height='10'/></defs><use xlink:href='#g0'/></svg>"#
+    )
+}
+
+/// Following references counts toward the depth limit: a short `<use>` chain parses, a chain
+/// past `MAX_SVG_DEPTH` levels is rejected by the tree, size and render APIs.
+#[test]
+fn svg_reference_depth_is_checked_before_recursive_parsing() {
+    let short = use_chain_svg(8);
+    assert!(svg_tree(short.as_bytes()).is_some());
+    let long = use_chain_svg(MAX_SVG_DEPTH);
+    assert!(svg_tree(long.as_bytes()).is_none());
+    assert!(natural_size(long.as_bytes()).is_none());
+    assert!(render_svg(long.as_bytes(), 10).is_none());
+}
+
 /// Markup-looking text in comments, CDATA and attributes does not count as XML depth.
 #[test]
 fn svg_depth_ignores_markup_in_comments_cdata_and_attributes() {
@@ -833,6 +854,30 @@ fn bmp_density_sets_natural_size() {
 }
 
 #[test]
+fn bmp_density_preserves_unrounded_axes_and_placement_policy() {
+    let mut bmp = bmp_with_ppm(11811);
+    bmp[42..46].copy_from_slice(&23622i32.to_le_bytes());
+    let (x, y) = raster_resolution(&bmp).unwrap();
+    assert!((x - 299.9994).abs() < 1e-9, "{x}");
+    assert!((y - 599.9988).abs() < 1e-9, "{y}");
+    let (w, h) = natural_size(&bmp).unwrap();
+    assert!((w - 144.000288000576).abs() < 1e-9, "{w}");
+    assert!((h - 108.000216000432).abs() < 1e-9, "{h}");
+    for (x, y) in [(1, 11811), (11811, 1), (i32::MAX, 11811), (11811, i32::MAX)] {
+        bmp[38..42].copy_from_slice(&x.to_le_bytes());
+        bmp[42..46].copy_from_slice(&y.to_le_bytes());
+        assert!(raster_resolution(&bmp).is_some());
+        assert_eq!(natural_size(&bmp), Some((600.0, 900.0)));
+    }
+    for (x, y) in [(0i32, 11811i32), (-1, 11811), (11811, 0), (11811, -1)] {
+        bmp[38..42].copy_from_slice(&x.to_le_bytes());
+        bmp[42..46].copy_from_slice(&y.to_le_bytes());
+        assert_eq!(raster_resolution(&bmp), None);
+        assert_eq!(natural_size(&bmp), Some((600.0, 900.0)));
+    }
+}
+
+#[test]
 fn tiff_resolution_tags_set_natural_size() {
     use tiff::encoder::colortype::Gray8;
     // A TIFF the encoder writes carries no density: pixels are points.
@@ -1168,4 +1213,33 @@ fn psd_resolution_preserves_axes_display_units_and_section_bounds() {
     // Bytes beyond the declared resource section must never complete a short payload.
     bytes[30..34].copy_from_slice(&24u32.to_be_bytes());
     assert_eq!(raster_resolution(&bytes), None);
+}
+
+#[test]
+fn gif_pixel_size_keeps_logical_screen_while_admission_checks_frame_extent() {
+    let mut gif = Vec::new();
+    gif.extend_from_slice(b"GIF89a");
+    gif.extend_from_slice(&10u16.to_le_bytes());
+    gif.extend_from_slice(&10u16.to_le_bytes());
+    gif.extend_from_slice(&[0x80, 0, 0]);
+    gif.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+    gif.push(0x2C);
+    gif.extend_from_slice(&15u16.to_le_bytes());
+    gif.extend_from_slice(&0u16.to_le_bytes());
+    gif.extend_from_slice(&5u16.to_le_bytes());
+    gif.extend_from_slice(&5u16.to_le_bytes());
+    gif.push(0);
+    gif.extend_from_slice(&[2, 2, 0x4C, 0x01, 0, 0x3B]);
+
+    assert_eq!(pixel_size(&gif), Some((10, 10)));
+    assert_eq!(craft_image_codecs::probe_allocation_size(&gif).ok(), Some((20, 10)));
+    assert!(!too_large_to_decode(&gif));
+
+    // A frame whose extent exceeds the RGBA decode budget is still rejected by admission
+    // even though the logical screen stays 10x10.
+    let mut oversized = gif;
+    oversized[19 + 5..19 + 7].copy_from_slice(&20_000u16.to_le_bytes());
+    oversized[19 + 7..19 + 9].copy_from_slice(&20_000u16.to_le_bytes());
+    assert_eq!(pixel_size(&oversized), Some((10, 10)));
+    assert!(too_large_to_decode(&oversized));
 }
